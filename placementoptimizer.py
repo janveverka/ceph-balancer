@@ -174,6 +174,10 @@ def parse_args():
     balancep.add_argument('--destination-osd-blacklist',
                           help=("only consider other osds as movement destination, separated by ',' or ' '. "
                                 'to avoid writing to a bucket, use "$(ceph osd ls-tree bucketname)"'))
+    balancep.add_argument('--max-backfill-reservations', type=int,
+                          help=("only consider osds with fewer backfills than the given maximum; "
+                                "includes both ongoing and planned backfills and "
+                                "applies to both movement source and destination OSDs."))
     balancep.add_argument('--pg-choice', choices=['largest', 'median', 'auto'],
                           default='largest',
                           help=('method to select a PG move candidate on a OSD based on its size. '
@@ -1951,6 +1955,10 @@ class ClusterState:
                 "status": osd["status"],
             })
 
+        # init osd backfill counters
+        for osd in self.osds.values():
+            osd["num_backfills_ongoing"] = 0
+
         # adjustments to the crush mappings
         # these are already applied in the pg->osd mapping infos via up/acting.
         for upmap_item in self.state["osd_dump"]["pg_upmap_items"]:
@@ -1971,6 +1979,11 @@ class ClusterState:
             remaps = remaps_merge(remaps)
 
             self.upmap_items[upmap_item["pgid"]] = remaps
+
+            # update osd backfill counters with the ongoing backfills
+            for osd_from, osd_to in remaps.items():
+                self.osds[osd_from]["num_backfills_ongoing"] += 1
+                self.osds[osd_to]["num_backfills_ongoing"] += 1
 
         # map osd -> pgs on it
         osd_mappings = defaultdict(
@@ -4721,6 +4734,10 @@ def balance(args, cluster):
         splitter = ',' if ',' in args.destination_osd_blacklist else None
         destination_osd_blacklist = [int(osdid) for osdid in args.destination_osd_blacklist.split(splitter)]
 
+    # init osd reserved backfill counters
+    for osd in cluster.osds.values():
+        osd["num_backfills_reserved"] = 0
+
     # number of found remaps
     found_remap_count = 0
 
@@ -4741,15 +4758,33 @@ def balance(args, cluster):
         found_remap = False
         last_attempt = -1
 
+        osd_from_candidates = []
+        exhausted_reservations = False
+
         # try to move the biggest pg from the fullest disk to the next suiting smaller disk
         for osd_from, osd_from_used_percent in pg_mappings.get_osd_from_candidates():
-            if found_remap or force_finish:
-                break
-
             # filter only-allowed source osds
             if source_osds is not None:
                 if osd_from not in source_osds:
                     continue
+            # filter only osds with available backfill reservations
+            if (
+                args.max_backfill_reservations is not None and 
+                args.max_backfill_reservations <= cluster.osds[osd_from]["num_backfills_ongoing"] + 
+                                                  cluster.osds[osd_from]["num_backfills_reserved"]
+            ):
+                exhausted_reservations = True
+                continue
+            osd_from_candidates.append((osd_from, osd_from_used_percent))
+        
+        if not osd_from_candidates:
+            if exhausted_reservations:
+                logging.warning("more movement may be possible but backfill reservations are exhausted.")
+            break
+        
+        for osd_from, osd_from_used_percent in osd_from_candidates:
+            if found_remap or force_finish:
+                break
 
             source_attempts += 1
 
@@ -4865,6 +4900,13 @@ def balance(args, cluster):
 
                     if osd_to in destination_osd_blacklist:
                         continue
+                    
+                    if (
+                        args.max_backfill_reservations is not None and 
+                        args.max_backfill_reservations <= cluster.osds[osd_to]["num_backfills_ongoing"] + 
+                                                          cluster.osds[osd_to]["num_backfills_reserved"]
+                    ):
+                        continue
 
                     logging.debug("TRY-1 move %s osd.%s => osd.%s", move_pg, osd_from, osd_to)
 
@@ -4979,6 +5021,8 @@ def balance(args, cluster):
 
                     found_remap = True
                     found_remap_count += 1
+                    cluster.osds[osd_from]["num_backfills_reserved"] += 1
+                    cluster.osds[osd_to]["num_backfills_reserved"] += 1
                     break
 
                 # end of to-loop
