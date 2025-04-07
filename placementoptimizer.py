@@ -171,6 +171,10 @@ def parse_args():
     balancep.add_argument('--source-osds',
                           help=("only consider these osds as movement source, separated by ',' or ' '. "
                                 'to balance just one bucket, use "$(ceph osd ls-tree bucketname)"'))
+    balancep.add_argument('--max-transfer-reservations', type=int,
+                          help=("only consider osds with fewer transfers than the given maximum; "
+                                "includes both ongoing and planned transfers and "
+                                "applies to both transfer source and destination OSDs."))
     balancep.add_argument('--pg-choice', choices=['largest', 'median', 'auto'],
                           default='largest',
                           help=('method to select a PG move candidate on a OSD based on its size. '
@@ -2133,6 +2137,7 @@ class ClusterState:
         # to estimate osd utilization with DELTA method.
         # this is the expected utilization change once we reach the up pg state.
         self.osd_transfer_remainings = dict()
+        self.osd_transfer_ongoing_nums = dict()
         for osdid, osdpgs in osd_mappings.items():
             if osdid == -1:
                 continue
@@ -2141,6 +2146,7 @@ class ClusterState:
             # this is the estimated size of remaining pg transfer amount
             # the already-transferred part is part of device_used.
             osd_transfer_remaining = 0
+            osd_transfer_ongoing_num = 0
 
             # this is a bit similar to the implementation of `show_remapped` to figure out
             # movement progress.
@@ -2269,14 +2275,18 @@ class ClusterState:
 
                 # add the estimated future shardsize
                 osd_transfer_remaining += missing_shards_size
+                osd_transfer_ongoing_num += 1
 
             # pgs that will be transferred off the osd
             for pg_outgoing in (osdpgs['acting'] - osdpgs['up']):
                 pginfo = self.pgs[pg_outgoing]
                 pg_shards_on_osd = pginfo["acting"].count(osdid)
                 osd_transfer_remaining -= self.get_pg_shardsize(pg_outgoing) * pg_shards_on_osd
+                osd_transfer_ongoing_num += 1
 
             self.osd_transfer_remainings[osdid] = osd_transfer_remaining
+            if osd_transfer_ongoing_num > 0:
+                self.osd_transfer_ongoing_nums[osdid] = osd_transfer_ongoing_num
 
             if False:
                 osd_fs_used = osd_transfer_remaining + osd['device_used']
@@ -4712,6 +4722,9 @@ def balance(args, cluster):
         splitter = ',' if ',' in args.source_osds else None
         source_osds = [int(osdid) for osdid in args.source_osds.split(splitter)]
 
+    # init counters of planned transfers per osd
+    osd_transfer_planned_nums = dict()
+
     # number of found remaps
     found_remap_count = 0
 
@@ -4741,6 +4754,12 @@ def balance(args, cluster):
             if source_osds is not None:
                 if osd_from not in source_osds:
                     continue
+
+            # filter only osds with available transfer reservations
+            transfer_reservations = cluster.osd_transfer_ongoing_nums.get(osd_from, 0)
+            transfer_reservations += osd_transfer_planned_nums.get(osd_from, 0)
+            if args.max_transfer_reservations is not None and args.max_transfer_reservations <= transfer_reservations:
+                continue
 
             source_attempts += 1
 
@@ -4852,6 +4871,12 @@ def balance(args, cluster):
                         raise RuntimeError("tried non-candidate target osd")
 
                     if osd_to == osd_from:
+                        continue
+
+                    # filter only osds with available transfer reservations
+                    transfer_reservations = cluster.osd_transfer_ongoing_nums.get(osd_to, 0)
+                    transfer_reservations += osd_transfer_planned_nums.get(osd_to, 0)
+                    if args.max_transfer_reservations is not None and args.max_transfer_reservations <= transfer_reservations:
                         continue
 
                     logging.debug("TRY-1 move %s osd.%s => osd.%s", move_pg, osd_from, osd_to)
@@ -4967,6 +4992,8 @@ def balance(args, cluster):
 
                     found_remap = True
                     found_remap_count += 1
+                    osd_transfer_planned_nums[osd_from] = osd_transfer_planned_nums.get(osd_from, 0) + 1
+                    osd_transfer_planned_nums[osd_to] = osd_transfer_planned_nums.get(osd_to, 0) + 1
                     break
 
                 # end of to-loop
